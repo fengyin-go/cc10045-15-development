@@ -79,5 +79,23 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 迟到数据恢复（告警再开启）
+
+告警策略支持从迟到数据恢复已关闭调查的状态流转：
+
+- `POST /api/pipeline/metrics/{metric_id}/values` 补录迟到采样（按业务时间写入）。
+- `POST /api/pipeline/alerts/{alert_id}/late-sample` 检查迟到采样：超限且落在已结案
+  业务区间时生成「告警再开启记录」（`alert_reopens` 表），关联原区间并保留原关闭证据；
+  按 `alert_id:metric_value_id` 幂等，同一新样本重复检查只产生一次有效介入。
+- `GET /api/pipeline/alerts/reopens?status=待领取` 下一班待办列表（含前任关闭证据）。
+- `POST /api/pipeline/anomaly/reopens/{reopen_id}/claim` 交班领取：单事务原子创建新调查，
+  带齐新证据采样与上一班关闭依据；重复/并发领取只得一份调查，不丢待办。
+- `GET /api/pipeline/anomaly/{entry_id}/samples` 主管分别查看本次归因与旧档使用的指标采样。
+- 旧的已关闭归因全程保持原样；再开启来源的新调查必须基于新证据真实检测才能结案，
+  不能借用旧结论直接关闭；未确认（未超限）采样不触碰旧调查。
+
+场景回归脚本：`backend/tests/e2e_reopen.py`（先启动后端，再
+`python -I backend/tests/e2e_reopen.py`，覆盖 17/19 号采样、重复检查、并发交接等 33 项断言）。
+
 领域：数据工程
 子方向：数据分析与数据应用

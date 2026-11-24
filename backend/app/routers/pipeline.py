@@ -1,7 +1,9 @@
 """数据分析管道路由：事件采集、聚合执行、指标快照、分群计算等核心操作入口。"""
 from __future__ import annotations
 
-from fastapi import APIRouter
+from typing import Any
+
+from fastapi import APIRouter, Body, Query
 
 from app.database import db
 from app.pipeline import (
@@ -113,6 +115,99 @@ def api_check_all_alerts() -> dict:
     """检查所有已生效告警规则。"""
     svc = service_for("alert_policy")
     return svc.check_all()
+
+
+# ---------------------------------------------------------------------------
+# 迟到数据恢复：告警再开启 → 归因领取 → 证据查看
+# ---------------------------------------------------------------------------
+
+@router.post("/metrics/{metric_id}/values")
+def api_backfill_metric_value(metric_id: int, payload: dict[str, Any] = Body(...)) -> dict:
+    """补录一条指标采样（迟到数据入口）。
+
+    body: {"snapshot_value": 数值, "snapshot_time": "YYYY-MM-DDTHH:MM:SS"(可选, 默认当前)}
+    迟到采样按业务时间写入，供告警再开启流程引用。
+    """
+    metric = db.fetchone("SELECT * FROM metrics WHERE id=?", [metric_id])
+    if metric is None:
+        return {"ok": False, "message": f"指标 {metric_id} 不存在"}
+    value = payload.get("snapshot_value")
+    if value is None:
+        return {"ok": False, "message": "缺少 snapshot_value"}
+    sample_time = str(payload.get("snapshot_time") or db.now())
+    sample_id = db.insert("metric_values", {
+        "metric_id": metric_id,
+        "snapshot_value": float(value),
+        "snapshot_time": sample_time,
+        "calibration_version": metric.get("calibration_version", 1),
+        "comparison_status": "已保存",
+    })
+    sample = db.fetchone("SELECT * FROM metric_values WHERE id=?", [sample_id])
+    return {"ok": True, "sample": sample}
+
+
+@router.post("/alerts/{alert_id}/late-sample")
+def api_register_late_sample(alert_id: int, payload: dict[str, Any] = Body(...)) -> dict:
+    """登记迟到采样检查：超限且落在已结案区间时生成告警再开启记录。
+
+    body: {"metric_value_id": 采样id, "interval_key": 业务区间(可选)}
+    幂等：同一采样重复检查只产生一次有效介入。
+    """
+    svc = service_for("alert_policy")
+    metric_value_id = payload.get("metric_value_id")
+    if metric_value_id is None:
+        return {"ok": False, "message": "缺少 metric_value_id"}
+    return svc.register_late_sample(
+        alert_id,
+        int(metric_value_id),
+        interval_key=payload.get("interval_key"),
+    )
+
+
+@router.get("/alerts/reopens")
+def api_list_reopens(
+    status: str | None = Query(default=None),
+    interval_key: str | None = Query(default=None),
+) -> dict:
+    """列出告警再开启记录（下一班待办），含前任关闭证据。"""
+    svc = service_for("alert_policy")
+    items = svc.list_reopens(status=status, interval_key=interval_key)
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/alerts/reopens/{reopen_id}")
+def api_get_reopen(reopen_id: int) -> dict:
+    """再开启记录详情：新采样、原关闭证据、领取状态。"""
+    svc = service_for("alert_policy")
+    reopen = svc.get_reopen(reopen_id)
+    if reopen is None:
+        return {"ok": False, "message": f"告警再开启记录 {reopen_id} 不存在"}
+    return {"ok": True, "reopen": reopen}
+
+
+@router.post("/anomaly/reopens/{reopen_id}/claim")
+def api_claim_reopen(reopen_id: int, payload: dict[str, Any] | None = Body(default=None)) -> dict:
+    """交班领取：原子领取再开启待办，生成带齐新证据与上一班关闭依据的新调查。"""
+    svc = service_for("anomaly_analysis")
+    claimed_by = str((payload or {}).get("claimed_by") or "下一班")
+    return svc.claim_reopen(reopen_id, claimed_by)
+
+
+@router.get("/anomaly/{entry_id}/samples")
+def api_investigation_samples(entry_id: int) -> dict:
+    """查看调查使用的指标采样：本次归因与旧档分开返回。"""
+    svc = service_for("anomaly_analysis")
+    result = svc.investigation_samples(entry_id)
+    if result is None:
+        return {"ok": False, "message": f"归因分析器 {entry_id} 不存在"}
+    return {"ok": True, **result}
+
+
+@router.post("/anomaly/{entry_id}/run")
+def api_run_analysis(entry_id: int) -> dict:
+    """执行归因分析（再开启来源的调查必须基于新证据真实检测）。"""
+    svc = service_for("anomaly_analysis")
+    return svc.run_analysis(entry_id)
 
 
 @router.get("/analytics/full-pipeline")

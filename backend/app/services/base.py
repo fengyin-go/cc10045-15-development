@@ -98,6 +98,10 @@ class BaseModuleService:
             data["name"] = values.get(self.LIST_FIELDS[0], "")
         data["status"] = self.STATUS_ORDER[0]
 
+        # 只保留表中真实存在的列：各模块表结构不同，缺列写入会直接失败
+        existing_cols = {row["name"] for row in db.fetchall(f"PRAGMA table_info({table})")}
+        data = {k: v for k, v in data.items() if k in existing_cols}
+
         entry_id = db.insert(table, data)
         entry = db.fetchone(f"SELECT * FROM {table} WHERE id=?", [entry_id])
         return entry, []

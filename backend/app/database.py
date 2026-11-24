@@ -278,6 +278,30 @@ DDL_STATEMENTS = [
         FOREIGN KEY (alert_id) REFERENCES alerts(id)
     )""",
 
+    # ==================== Alert Reopen Tier ====================
+    # 告警再开启记录：迟到超限采样关联已结案业务区间，保留原关闭证据。
+    # dedupe_key = alert_id:metric_value_id，保证同一新样本重复检查只产生一次有效介入。
+    """CREATE TABLE IF NOT EXISTS alert_reopens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        dedupe_key TEXT NOT NULL UNIQUE,
+        alert_id INTEGER NOT NULL,
+        interval_key TEXT NOT NULL,
+        metric_id INTEGER NOT NULL,
+        metric_value_id INTEGER NOT NULL,
+        metric_value REAL NOT NULL,
+        sample_time TEXT NOT NULL,
+        previous_analysis_id INTEGER,
+        closure_evidence TEXT NOT NULL DEFAULT '{}',
+        status TEXT NOT NULL DEFAULT '待领取',
+        claimed_by TEXT,
+        claimed_at TEXT,
+        analysis_id INTEGER,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY (alert_id) REFERENCES alerts(id)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_reopens_interval ON alert_reopens(interval_key, status)",
+    "CREATE INDEX IF NOT EXISTS idx_reopens_alert ON alert_reopens(alert_id, status)",
+
     """CREATE TABLE IF NOT EXISTS query_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         executor TEXT NOT NULL DEFAULT 'system',
@@ -373,8 +397,33 @@ class AnalyticsDB:
         conn.execute("PRAGMA busy_timeout=5000")
         for stmt in DDL_STATEMENTS:
             conn.execute(stmt)
+        self._migrate(conn)
         conn.commit()
         conn.close()
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """轻量迁移：为已存在的表补充迟到数据再开启流程所需的新列。"""
+        existing = {
+            row[1] for row in conn.execute("PRAGMA table_info(anomaly_analyses)").fetchall()
+        }
+        new_columns = {
+            # 业务区间标识：同一区间的迟到采样关联回已结案调查
+            "interval_key": "ALTER TABLE anomaly_analyses ADD COLUMN interval_key TEXT",
+            # 本次归因实际使用的指标采样 id 列表（JSON），旧档/新调查各自独立
+            "evidence_sample_ids": "ALTER TABLE anomaly_analyses ADD COLUMN evidence_sample_ids TEXT NOT NULL DEFAULT '[]'",
+            # 来源：告警再开启记录
+            "reopen_id": "ALTER TABLE anomaly_analyses ADD COLUMN reopen_id INTEGER",
+            # 上一班（前任）已结案调查与关闭依据快照
+            "predecessor_analysis_id": "ALTER TABLE anomaly_analyses ADD COLUMN predecessor_analysis_id INTEGER",
+            "predecessor_closure": "ALTER TABLE anomaly_analyses ADD COLUMN predecessor_closure TEXT",
+            # 交班领取信息
+            "claimed_by": "ALTER TABLE anomaly_analyses ADD COLUMN claimed_by TEXT",
+            "claimed_at": "ALTER TABLE anomaly_analyses ADD COLUMN claimed_at TEXT",
+        }
+        for column, ddl in new_columns.items():
+            if column not in existing:
+                conn.execute(ddl)
 
     @classmethod
     def get(cls) -> AnalyticsDB:
@@ -391,8 +440,10 @@ class AnalyticsDB:
         return self._local.conn
 
     @contextmanager
-    def tx(self) -> Generator[sqlite3.Connection, None, None]:
+    def tx(self, immediate: bool = False) -> Generator[sqlite3.Connection, None, None]:
         conn = self._get_conn()
+        if immediate:
+            conn.execute("BEGIN IMMEDIATE")
         try:
             yield conn
             conn.commit()

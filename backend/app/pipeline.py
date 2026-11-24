@@ -657,6 +657,7 @@ def detect_anomaly(analysis: dict[str, Any]) -> dict[str, Any]:
         "mean": round(mean_v, 4),
         "std": round(std_v, 4),
         "latest_value": latest,
+        "sample_ids": [s["id"] for s in all_snapshots],
         "contributions": contributions,
         "conclusion": conclusion,
         "status": "已完成" if abs(z_score) >= 3 else "已完成",
@@ -1009,32 +1010,8 @@ def precompute_cube(cube: dict[str, Any]) -> int:
 # 告警检查管道
 # ============================================================================
 
-def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
-    """检查告警条件是否触发。
-
-    从 metric_values 获取最新指标值，对比告警条件判断是否触发，
-    达到连续触发阈值才写入 alert_log。
-    """
-    alert_id = alert["id"]
-    monitor_metric = alert.get("监控指标", alert.get("monitor_metric", ""))
-    alert_condition = alert.get("告警条件", alert.get("alert_condition", ">"))
-    threshold_raw = alert.get("连续触发次数", alert.get("consecutive_threshold", 3))
-    threshold = int(threshold_raw)
-
-    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{monitor_metric}%"])
-    if not metric:
-        return None
-
-    latest = db.fetchone(
-        "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
-        [metric["id"]],
-    )
-    if not latest:
-        return None
-
-    current_value = latest["snapshot_value"]
-
-    # 解析告警条件
+def evaluate_condition(current_value: float, alert_condition: str) -> bool:
+    """判定单个指标值是否满足告警条件（支持 >、<、>=、<=，逗号分隔多条件）。"""
     conditions = alert_condition.split(",") if "," in alert_condition else [alert_condition]
     triggered = False
     for cond in conditions:
@@ -1067,6 +1044,34 @@ def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
                     triggered = True
             except ValueError:
                 pass
+    return triggered
+
+
+def check_alert(alert: dict[str, Any]) -> dict[str, Any] | None:
+    """检查告警条件是否触发。
+
+    从 metric_values 获取最新指标值，对比告警条件判断是否触发，
+    达到连续触发阈值才写入 alert_log。
+    """
+    alert_id = alert["id"]
+    monitor_metric = alert.get("监控指标", alert.get("monitor_metric", ""))
+    alert_condition = alert.get("告警条件", alert.get("alert_condition", ">"))
+    threshold_raw = alert.get("连续触发次数", alert.get("consecutive_threshold", 3))
+    threshold = int(threshold_raw)
+
+    metric = db.fetchone("SELECT id FROM metrics WHERE metric_name LIKE ?", [f"%{monitor_metric}%"])
+    if not metric:
+        return None
+
+    latest = db.fetchone(
+        "SELECT snapshot_value FROM metric_values WHERE metric_id=? ORDER BY snapshot_time DESC LIMIT 1",
+        [metric["id"]],
+    )
+    if not latest:
+        return None
+
+    current_value = latest["snapshot_value"]
+    triggered = evaluate_condition(current_value, alert_condition)
 
     if triggered:
         recent_logs = db.fetchall(
